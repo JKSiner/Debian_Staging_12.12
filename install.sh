@@ -1,141 +1,143 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# NVIDIA Driver installer for Debian 12 (bookworm) via NVIDIA LOCAL repo
+# Debian 12 + NVIDIA (CUDA deb_network repo) driver installer
+# Based on NVIDIA CUDA "deb (network)" flow: cuda-keyring -> apt update -> install driver
+#
 # Usage:
-#   sudo bash install.sh                # uses default DRIVER_VER
-#   sudo bash install.sh 580.105.08     # custom driver version
+#   sudo bash install.sh
+#   sudo DRIVER_FLAVOR=open bash install.sh
+#   sudo DRIVER_FLAVOR=proprietary bash install.sh
+#   sudo PIN_VERSION=580.105.08-1 DRIVER_FLAVOR=open bash install.sh
 #
-# Optional env:
-#   FORCE_OPEN=1  -> install nvidia-open instead of nvidia-driver
-#
-# Notes:
-# - Will blacklist nouveau and rebuild initramfs
-# - Requires reboot
-# - Designed for Debian 12
+# Env:
+#   DRIVER_FLAVOR=open|proprietary   (default: open)
+#   PIN_VERSION=580.105.08-1         (optional exact Debian package version to pin)
+#   DISABLE_NOUVEAU=1                (optional: blacklist nouveau + update-initramfs)
+#   REBOOT_AFTER=1                   (optional: reboot at end)
 
-DRIVER_VER="${1:-580.105.08}"
-FORCE_OPEN="${FORCE_OPEN:-0}"
+DRIVER_FLAVOR="${DRIVER_FLAVOR:-open}"   # open recommended for Ada DC in your case
+PIN_VERSION="${PIN_VERSION:-}"           # e.g. 580.105.08-1 (optional)
+DISABLE_NOUVEAU="${DISABLE_NOUVEAU:-0}"
+REBOOT_AFTER="${REBOOT_AFTER:-0}"
 
-if [[ $EUID -ne 0 ]]; then
-  echo "ERROR: Run as root (use sudo)."
-  exit 1
-fi
+log(){ echo -e "\n==> $*\n"; }
 
-if [[ ! -f /etc/os-release ]]; then
-  echo "ERROR: /etc/os-release not found"
-  exit 1
-fi
+require_root(){
+  [[ "${EUID}" -eq 0 ]] || { echo "Run as root: sudo bash install.sh"; exit 1; }
+}
 
-. /etc/os-release
-if [[ "${ID:-}" != "debian" ]]; then
-  echo "ERROR: This script is intended for Debian (detected ID=${ID:-unknown})."
-  exit 1
-fi
+check_debian12(){
+  . /etc/os-release
+  [[ "${ID:-}" == "debian" ]] || { echo "This script is for Debian. Detected: ${ID:-unknown}"; exit 1; }
+  [[ "${VERSION_ID:-}" == "12" ]] || { echo "This script targets Debian 12. Detected: ${VERSION_ID:-unknown}"; exit 1; }
+}
 
-# Debian 12 = bookworm
-if [[ "${VERSION_CODENAME:-}" != "bookworm" ]]; then
-  echo "WARNING: This script targets Debian 12 (bookworm). Detected: ${VERSION_CODENAME:-unknown}"
-  echo "         It may still work, but URLs/repo package name are Debian12-specific."
-fi
+install_prereqs(){
+  log "Installing prerequisites..."
+  apt-get update -y
+  apt-get install -y --no-install-recommends \
+    ca-certificates curl wget gnupg lsb-release \
+    pciutils \
+    dkms build-essential "linux-headers-$(uname -r)"
+}
 
-echo "==> Debian: ${PRETTY_NAME:-Debian}"
-echo "==> Kernel: $(uname -r)"
-echo "==> Target NVIDIA driver: ${DRIVER_VER}"
-echo
-
-echo "==> Installing prerequisites..."
-apt update
-apt install -y ca-certificates curl wget gnupg lsb-release \
-              build-essential dkms "linux-headers-$(uname -r)" \
-              pciutils
-
-echo "==> Blacklisting nouveau..."
-cat >/etc/modprobe.d/blacklist-nouveau.conf <<'EOF'
+maybe_disable_nouveau(){
+  if [[ "${DISABLE_NOUVEAU}" == "1" ]]; then
+    log "Blacklisting nouveau + updating initramfs..."
+    cat >/etc/modprobe.d/blacklist-nouveau.conf <<'EOF'
 blacklist nouveau
 options nouveau modeset=0
 EOF
-update-initramfs -u
-
-echo "==> Purging Debian NVIDIA/CUDA packages (if any)..."
-apt purge -y 'nvidia-*' '*cuda*' || true
-apt autoremove -y || true
-
-DEB_NAME="nvidia-driver-local-repo-debian12-${DRIVER_VER}_amd64.deb"
-URL="https://developer.download.nvidia.com/compute/nvidia-driver/${DRIVER_VER}/local_installers/${DEB_NAME}"
-
-echo "==> Downloading NVIDIA local repo package..."
-TMPDIR="$(mktemp -d)"
-cd "$TMPDIR"
-echo "    ${URL}"
-wget -q --show-progress "$URL" -O "$DEB_NAME"
-
-echo "==> Installing NVIDIA local repo package..."
-dpkg -i "$DEB_NAME"
-
-REPO_DIR="/var/nvidia-driver-local-repo-debian12-${DRIVER_VER}"
-KEYRING_SRC="$(ls -1 ${REPO_DIR}/nvidia-driver-*-keyring.gpg 2>/dev/null | head -n 1 || true)"
-if [[ -z "${KEYRING_SRC}" ]]; then
-  echo "ERROR: Keyring not found in ${REPO_DIR}"
-  ls -la "${REPO_DIR}" || true
-  exit 1
-fi
-
-echo "==> Installing repo keyring..."
-cp -v "${KEYRING_SRC}" /usr/share/keyrings/
-
-echo "==> apt update..."
-apt update
-
-install_proprietary() {
-  echo "==> Installing proprietary driver packages..."
-  apt install -y nvidia-driver nvidia-kernel-dkms
+    update-initramfs -u
+  fi
 }
 
-install_open() {
-  echo "==> Installing OPEN kernel module driver packages..."
-  apt install -y nvidia-open
+install_cuda_keyring(){
+  log "Installing NVIDIA CUDA APT repo keyring (deb_network)..."
+  local keyring_url="https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb"
+  wget -q --show-progress "${keyring_url}" -O /tmp/cuda-keyring.deb
+  dpkg -i /tmp/cuda-keyring.deb
+  rm -f /tmp/cuda-keyring.deb
+  apt-get update -y
 }
 
-if [[ "${FORCE_OPEN}" == "1" ]]; then
-  install_open
-else
-  # Try proprietary first
-  install_proprietary
-fi
+purge_old_debian_driver(){
+  log "Purging Debian NVIDIA/CUDA packages (if any)..."
+  apt-get purge -y 'nvidia-*' '*cuda*' || true
+  apt-get autoremove -y || true
+}
 
-echo "==> Rebuilding initramfs..."
-update-initramfs -u
+install_driver_open(){
+  log "Installing NVIDIA OPEN kernel modules driver..."
+  if [[ -n "${PIN_VERSION}" ]]; then
+    # Pin exact version (must exist in repo)
+    apt-get install -y "nvidia-open=${PIN_VERSION}" "nvidia-smi=${PIN_VERSION}" || \
+      apt-get install -y "nvidia-open=${PIN_VERSION}" || true
+  else
+    apt-get install -y nvidia-open
+  fi
+}
 
-echo "==> Attempting to load driver modules (no reboot yet)..."
-systemctl stop nvidia-persistenced 2>/dev/null || true
-modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia 2>/dev/null || true
-modprobe nvidia 2>/dev/null || true
-modprobe nvidia_uvm 2>/dev/null || true
-modprobe nvidia_modeset 2>/dev/null || true
-modprobe nvidia_drm 2>/dev/null || true
+install_driver_proprietary(){
+  log "Installing NVIDIA proprietary kernel modules driver (cuda-drivers)..."
+  if [[ -n "${PIN_VERSION}" ]]; then
+    apt-get install -y "cuda-drivers=${PIN_VERSION}" || true
+  else
+    apt-get install -y cuda-drivers
+  fi
+}
 
-echo "==> Checking for 'open kernel modules required' hint..."
-if dmesg | grep -qi "requires use of the NVIDIA open kernel modules"; then
-  echo "!! Detected: GPU requires NVIDIA OPEN kernel modules."
-  echo "==> Switching to nvidia-open..."
-  apt purge -y nvidia-driver nvidia-kernel-dkms || true
-  apt autoremove -y || true
-  install_open
+post_steps(){
+  log "Rebuilding initramfs..."
   update-initramfs -u
-fi
 
-echo "==> Cleanup..."
-cd /
-rm -rf "$TMPDIR"
+  log "Trying to load modules (best effort, reboot still recommended)..."
+  systemctl stop nvidia-persistenced 2>/dev/null || true
+  modprobe -r nvidia_drm nvidia_modeset nvidia_uvm nvidia 2>/dev/null || true
+  modprobe nvidia 2>/dev/null || true
+  modprobe nvidia_uvm 2>/dev/null || true
+  modprobe nvidia_modeset 2>/dev/null || true
+  modprobe nvidia_drm 2>/dev/null || true
 
-echo
-echo "============================================================"
-echo "Installation finished."
-echo "Next: reboot is required."
-echo "  sudo reboot"
-echo
-echo "After reboot verify:"
-echo "  nvidia-smi"
-echo "  nvidia-smi -L"
-echo "============================================================"
+  log "Driver version (if available):"
+  modinfo nvidia 2>/dev/null | egrep -i '^(version:|filename:)' || true
+
+  log "nvidia-smi (may require reboot):"
+  nvidia-smi || true
+
+  echo
+  echo "============================================================"
+  echo "DONE. Recommended next step:"
+  echo "  sudo reboot"
+  echo
+  echo "After reboot verify:"
+  echo "  nvidia-smi"
+  echo "  nvidia-smi -L"
+  echo "============================================================"
+  echo
+
+  if [[ "${REBOOT_AFTER}" == "1" ]]; then
+    log "Rebooting..."
+    reboot
+  fi
+}
+
+main(){
+  require_root
+  check_debian12
+  install_prereqs
+  maybe_disable_nouveau
+  purge_old_debian_driver
+  install_cuda_keyring
+
+  case "${DRIVER_FLAVOR}" in
+    open) install_driver_open ;;
+    proprietary) install_driver_proprietary ;;
+    *) echo "Invalid DRIVER_FLAVOR=${DRIVER_FLAVOR} (use: open|proprietary)"; exit 1 ;;
+  esac
+
+  post_steps
+}
+
+main "$@"
